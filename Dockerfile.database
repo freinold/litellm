@@ -62,8 +62,8 @@ RUN pip install PyJWT --no-cache-dir
 RUN chmod +x build_admin_ui.sh && ./build_admin_ui.sh
 
 # Set prisma env variables
-ENV PRISMA_HOME_DIR = "/app"
-ENV PRISMA_NODEENV_CACHE_DIR = "/app/.cache/prisma-python/nodeenv/"
+ENV PRISMA_HOME_DIR="/app"
+ENV PRISMA_NODEENV_CACHE_DIR="/app/.cache/prisma-python/nodeenv/"
 
 # Generate prisma client
 RUN prisma generate

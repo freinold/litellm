@@ -422,12 +422,11 @@ async def ollama_async_streaming(url, data, model_response, encoding, logging_ob
                 async for transformed_chunk in streamwrapper:
                     yield transformed_chunk
     except Exception as e:
-        verbose_logger.error(
+        verbose_logger.exception(
             "LiteLLM.ollama.py::ollama_async_streaming(): Exception occured - {}".format(
                 str(e)
             )
         )
-        verbose_logger.debug(traceback.format_exc())
 
         raise e
 
@@ -498,12 +497,11 @@ async def ollama_acompletion(
             )
             return model_response
     except Exception as e:
-        verbose_logger.error(
+        verbose_logger.exception(
             "LiteLLM.ollama.py::ollama_acompletion(): Exception occured - {}".format(
                 str(e)
             )
         )
-        verbose_logger.debug(traceback.format_exc())
         raise e
 
 
@@ -601,12 +599,12 @@ def ollama_embeddings(
 ):
     return asyncio.run(
         ollama_aembeddings(
-            api_base,
-            model,
-            prompts,
-            optional_params,
-            logging_obj,
-            model_response,
-            encoding,
+            api_base=api_base,
+            model=model,
+            prompts=prompts,
+            model_response=model_response,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            encoding=encoding,
         )
     )

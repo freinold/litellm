@@ -66,6 +66,11 @@ ENV PRISMA_HOME_DIR="/app"
 ENV PRISMA_NODEENV_CACHE_DIR="/app/.cache/prisma-python/nodeenv/"
 
 # Generate prisma client
+ENV PRISMA_BINARY_CACHE_DIR=/app/prisma
+RUN mkdir -p /.cache
+RUN chmod -R 777 /.cache
+RUN pip install nodejs-bin
+RUN pip install prisma
 RUN prisma generate
 RUN chmod +x entrypoint.sh
 

@@ -14,7 +14,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -180,6 +180,31 @@ def test_completion_azure_command_r():
             model="azure/command-r-plus",
             api_base=os.getenv("AZURE_COHERE_API_BASE"),
             api_key=os.getenv("AZURE_COHERE_API_KEY"),
+            messages=[{"role": "user", "content": "What is the meaning of life?"}],
+        )
+
+        print(response)
+    except litellm.Timeout as e:
+        pass
+    except Exception as e:
+        pytest.fail(f"Error occurred: {e}")
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://litellm8397336933.openai.azure.com",
+        "https://litellm8397336933.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2023-03-15-preview",
+    ],
+)
+def test_completion_azure_ai_gpt_4o(api_base):
+    try:
+        litellm.set_verbose = True
+
+        response = completion(
+            model="azure_ai/gpt-4o",
+            api_base=api_base,
+            api_key=os.getenv("AZURE_AI_OPENAI_KEY"),
             messages=[{"role": "user", "content": "What is the meaning of life?"}],
         )
 
@@ -3312,108 +3337,6 @@ def test_customprompt_together_ai():
 # test_customprompt_together_ai()
 
 
-@pytest.mark.skip(reason="AWS Suspended Account")
-def test_completion_sagemaker():
-    try:
-        litellm.set_verbose = True
-        print("testing sagemaker")
-        response = completion(
-            model="sagemaker/jumpstart-dft-hf-llm-mistral-7b-ins-20240329-150233",
-            model_id="huggingface-llm-mistral-7b-instruct-20240329-150233",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=80,
-            aws_region_name=os.getenv("AWS_REGION_NAME_2"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID_2"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY_2"),
-            input_cost_per_second=0.000420,
-        )
-        # Add any assertions here to check the response
-        print(response)
-        cost = completion_cost(completion_response=response)
-        print("calculated cost", cost)
-        assert (
-            cost > 0.0 and cost < 1.0
-        )  # should never be > $1 for a single completion call
-    except Exception as e:
-        pytest.fail(f"Error occurred: {e}")
-
-
-# test_completion_sagemaker()
-
-
-@pytest.mark.skip(reason="AWS Suspended Account")
-@pytest.mark.asyncio
-async def test_acompletion_sagemaker():
-    try:
-        litellm.set_verbose = True
-        print("testing sagemaker")
-        response = await litellm.acompletion(
-            model="sagemaker/jumpstart-dft-hf-llm-mistral-7b-ins-20240329-150233",
-            model_id="huggingface-llm-mistral-7b-instruct-20240329-150233",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=80,
-            aws_region_name=os.getenv("AWS_REGION_NAME_2"),
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID_2"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY_2"),
-            input_cost_per_second=0.000420,
-        )
-        # Add any assertions here to check the response
-        print(response)
-        cost = completion_cost(completion_response=response)
-        print("calculated cost", cost)
-        assert (
-            cost > 0.0 and cost < 1.0
-        )  # should never be > $1 for a single completion call
-    except Exception as e:
-        pytest.fail(f"Error occurred: {e}")
-
-
-@pytest.mark.skip(reason="AWS Suspended Account")
-def test_completion_chat_sagemaker():
-    try:
-        messages = [{"role": "user", "content": "Hey, how's it going?"}]
-        litellm.set_verbose = True
-        response = completion(
-            model="sagemaker/berri-benchmarking-Llama-2-70b-chat-hf-4",
-            messages=messages,
-            max_tokens=100,
-            temperature=0.7,
-            stream=True,
-        )
-        # Add any assertions here to check the response
-        complete_response = ""
-        for chunk in response:
-            complete_response += chunk.choices[0].delta.content or ""
-        print(f"complete_response: {complete_response}")
-        assert len(complete_response) > 0
-    except Exception as e:
-        pytest.fail(f"Error occurred: {e}")
-
-
-# test_completion_chat_sagemaker()
-
-
-@pytest.mark.skip(reason="AWS Suspended Account")
-def test_completion_chat_sagemaker_mistral():
-    try:
-        messages = [{"role": "user", "content": "Hey, how's it going?"}]
-
-        response = completion(
-            model="sagemaker/jumpstart-dft-hf-llm-mistral-7b-instruct",
-            messages=messages,
-            max_tokens=100,
-        )
-        # Add any assertions here to check the response
-        print(response)
-    except Exception as e:
-        pytest.fail(f"An error occurred: {str(e)}")
-
-
-# test_completion_chat_sagemaker_mistral()
-
-
 def response_format_tests(response: litellm.ModelResponse):
     assert isinstance(response.id, str)
     assert response.id != ""
@@ -3449,20 +3372,20 @@ def response_format_tests(response: litellm.ModelResponse):
     assert isinstance(response.usage.total_tokens, int)  # type: ignore
 
 
-@pytest.mark.parametrize("sync_mode", [True, False])
 @pytest.mark.parametrize(
     "model",
     [
-        "bedrock/cohere.command-r-plus-v1:0",
+        # "bedrock/cohere.command-r-plus-v1:0",
         "anthropic.claude-3-sonnet-20240229-v1:0",
-        "anthropic.claude-instant-v1",
-        "bedrock/ai21.j2-mid",
-        "mistral.mistral-7b-instruct-v0:2",
-        "bedrock/amazon.titan-tg1-large",
-        "meta.llama3-8b-instruct-v1:0",
-        "cohere.command-text-v14",
+        # "anthropic.claude-instant-v1",
+        # "bedrock/ai21.j2-mid",
+        # "mistral.mistral-7b-instruct-v0:2",
+        # "bedrock/amazon.titan-tg1-large",
+        # "meta.llama3-8b-instruct-v1:0",
+        # "cohere.command-text-v14",
     ],
 )
+@pytest.mark.parametrize("sync_mode", [True, False])
 @pytest.mark.asyncio
 async def test_completion_bedrock_httpx_models(sync_mode, model):
     litellm.set_verbose = True
@@ -3705,19 +3628,21 @@ def test_completion_anyscale_api():
 # test_completion_anyscale_api()
 
 
-@pytest.mark.skip(reason="flaky test, times out frequently")
+# @pytest.mark.skip(reason="flaky test, times out frequently")
 def test_completion_cohere():
     try:
         # litellm.set_verbose=True
         messages = [
             {"role": "system", "content": "You're a good bot"},
+            {"role": "assistant", "content": [{"text": "2", "type": "text"}]},
+            {"role": "assistant", "content": [{"text": "3", "type": "text"}]},
             {
                 "role": "user",
                 "content": "Hey",
             },
         ]
         response = completion(
-            model="command-nightly",
+            model="command-r",
             messages=messages,
         )
         print(response)

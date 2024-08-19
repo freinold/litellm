@@ -246,10 +246,9 @@ class LangFuseLogger:
 
             return {"trace_id": trace_id, "generation_id": generation_id}
         except Exception as e:
-            verbose_logger.error(
+            verbose_logger.exception(
                 "Langfuse Layer Error(): Exception occured - {}".format(str(e))
             )
-            verbose_logger.debug(traceback.format_exc())
             return {"trace_id": None, "generation_id": None}
 
     async def _async_log_event(
@@ -605,6 +604,12 @@ class LangFuseLogger:
             if "cache_key" in litellm.langfuse_default_tags:
                 _hidden_params = metadata.get("hidden_params", {}) or {}
                 _cache_key = _hidden_params.get("cache_key", None)
+                if _cache_key is None:
+                    # fallback to using "preset_cache_key"
+                    _preset_cache_key = kwargs.get("litellm_params", {}).get(
+                        "preset_cache_key", None
+                    )
+                    _cache_key = _preset_cache_key
                 tags.append(f"cache_key:{_cache_key}")
         return tags
 
@@ -676,7 +681,6 @@ def log_provider_specific_information_as_span(
     Returns:
         None
     """
-    from litellm.proxy.proxy_server import premium_user
 
     _hidden_params = clean_metadata.get("hidden_params", None)
     if _hidden_params is None:

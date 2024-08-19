@@ -13,7 +13,15 @@ import traceback
 import uuid
 import warnings
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    List,
+    Optional,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 import requests
 
@@ -140,6 +148,10 @@ from litellm.proxy.common_utils.admin_ui_utils import (
     html_form,
     show_missing_vars_in_env,
 )
+from litellm.proxy.common_utils.callback_utils import (
+    get_remaining_tokens_and_requests_from_request_data,
+    initialize_callbacks_on_proxy,
+)
 from litellm.proxy.common_utils.debug_utils import init_verbose_loggers
 from litellm.proxy.common_utils.debug_utils import router as debugging_endpoints_router
 from litellm.proxy.common_utils.encrypt_decrypt_utils import (
@@ -150,7 +162,6 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     check_file_size_under_limit,
 )
-from litellm.proxy.common_utils.init_callbacks import initialize_callbacks_on_proxy
 from litellm.proxy.common_utils.load_config_utils import get_file_contents_from_s3
 from litellm.proxy.common_utils.openai_endpoint_utils import (
     remove_sensitive_info_from_deployment,
@@ -187,6 +198,10 @@ from litellm.proxy.openai_files_endpoints.files_endpoints import set_files_confi
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     initialize_pass_through_endpoints,
 )
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    router as pass_through_router,
+)
+from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.secret_managers.aws_secret_manager import (
     load_aws_kms,
     load_aws_secret_manager,
@@ -214,6 +229,9 @@ from litellm.proxy.utils import (
     reset_budget,
     send_email,
     update_spend,
+)
+from litellm.proxy.vertex_ai_endpoints.google_ai_studio_endpoints import (
+    router as gemini_router,
 )
 from litellm.proxy.vertex_ai_endpoints.vertex_endpoints import router as vertex_router
 from litellm.proxy.vertex_ai_endpoints.vertex_endpoints import set_default_vertex_config
@@ -491,6 +509,7 @@ def get_custom_headers(
     model_region: Optional[str] = None,
     response_cost: Optional[Union[float, str]] = None,
     fastest_response_batch_completion: Optional[bool] = None,
+    request_data: Optional[dict] = {},
     **kwargs,
 ) -> dict:
     exclude_values = {"", None}
@@ -511,6 +530,12 @@ def get_custom_headers(
         ),
         **{k: str(v) for k, v in kwargs.items()},
     }
+    if request_data:
+        remaining_tokens_header = get_remaining_tokens_and_requests_from_request_data(
+            request_data
+        )
+        headers.update(remaining_tokens_header)
+
     try:
         return {
             key: value for key, value in headers.items() if value not in exclude_values
@@ -547,6 +572,37 @@ async def check_request_disconnection(request: Request, llm_api_call_task):
                 status_code=499,
                 detail="Client disconnected the request",
             )
+
+
+def _resolve_typed_dict_type(typ):
+    """Resolve the actual TypedDict class from a potentially wrapped type."""
+    from typing_extensions import _TypedDictMeta  # type: ignore
+
+    origin = get_origin(typ)
+    if origin is Union:  # Check if it's a Union (like Optional)
+        for arg in get_args(typ):
+            if isinstance(arg, _TypedDictMeta):
+                return arg
+    elif isinstance(typ, type) and isinstance(typ, dict):
+        return typ
+    return None
+
+
+def _resolve_pydantic_type(typ) -> List:
+    """Resolve the actual TypedDict class from a potentially wrapped type."""
+    origin = get_origin(typ)
+    typs = []
+    if origin is Union:  # Check if it's a Union (like Optional)
+        for arg in get_args(typ):
+            if (
+                arg is not None
+                and not isinstance(arg, type(None))
+                and "NoneType" not in str(arg)
+            ):
+                typs.append(arg)
+    elif isinstance(typ, type) and isinstance(typ, BaseModel):
+        return [typ]
+    return typs
 
 
 def prisma_setup(database_url: Optional[str]):
@@ -869,8 +925,8 @@ async def update_database(
                         + prisma_client.key_list_transactons.get(hashed_token, 0)
                     )
             except Exception as e:
-                verbose_proxy_logger.error(
-                    f"Update Key DB Call failed to execute - {str(e)}\n{traceback.format_exc()}"
+                verbose_proxy_logger.exception(
+                    f"Update Key DB Call failed to execute - {str(e)}"
                 )
                 raise e
 
@@ -1162,8 +1218,8 @@ async def update_cache(
                 existing_spend_obj.spend = new_spend
                 user_api_key_cache.set_cache(key=_id, value=existing_spend_obj.json())
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"An error occurred updating end user cache: {str(e)}\n\n{traceback.format_exc()}"
+            verbose_proxy_logger.exception(
+                f"An error occurred updating end user cache: {str(e)}"
             )
 
     ### UPDATE TEAM SPEND ###
@@ -1204,8 +1260,8 @@ async def update_cache(
                 existing_spend_obj.spend = new_spend
                 user_api_key_cache.set_cache(key=_id, value=existing_spend_obj)
         except Exception as e:
-            verbose_proxy_logger.error(
-                f"An error occurred updating end user cache: {str(e)}\n\n{traceback.format_exc()}"
+            verbose_proxy_logger.exception(
+                f"An error occurred updating end user cache: {str(e)}"
             )
 
     if token is not None and response_cost is not None:
@@ -2072,7 +2128,7 @@ class ProxyConfig:
                 self._add_deployment(db_models=new_models)
 
         except Exception as e:
-            verbose_proxy_logger.error(
+            verbose_proxy_logger.exception(
                 f"Error adding/deleting model to llm_router: {str(e)}"
             )
 
@@ -2191,6 +2247,15 @@ class ProxyConfig:
                 alerting_args=general_settings["alerting_args"],
             )
 
+        ## PASS-THROUGH ENDPOINTS ##
+        if "pass_through_endpoints" in _general_settings:
+            general_settings["pass_through_endpoints"] = _general_settings[
+                "pass_through_endpoints"
+            ]
+            await initialize_pass_through_endpoints(
+                pass_through_endpoints=general_settings["pass_through_endpoints"]
+            )
+
     async def add_deployment(
         self,
         prisma_client: PrismaClient,
@@ -2211,7 +2276,7 @@ class ProxyConfig:
             try:
                 new_models = await prisma_client.db.litellm_proxymodeltable.find_many()
             except Exception as e:
-                verbose_proxy_logger.error(
+                verbose_proxy_logger.exception(
                     "litellm.proxy_server.py::add_deployment() - Error getting new models from DB - {}".format(
                         str(e)
                     )
@@ -2233,8 +2298,10 @@ class ProxyConfig:
                 )
 
         except Exception as e:
-            verbose_proxy_logger.error(
-                "{}\nTraceback:{}".format(str(e), traceback.format_exc())
+            verbose_proxy_logger.exception(
+                "litellm.proxy.proxy_server.py::ProxyConfig:add_deployment - {}".format(
+                    str(e)
+                )
             )
 
 
@@ -2401,12 +2468,11 @@ async def async_assistants_data_generator(
         done_message = "[DONE]"
         yield f"data: {done_message}\n\n"
     except Exception as e:
-        verbose_proxy_logger.error(
+        verbose_proxy_logger.exception(
             "litellm.proxy.proxy_server.async_assistants_data_generator(): Exception occured - {}".format(
                 str(e)
             )
         )
-        verbose_proxy_logger.debug(traceback.format_exc())
         await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=e,
@@ -2459,9 +2525,9 @@ async def async_data_generator(
         done_message = "[DONE]"
         yield f"data: {done_message}\n\n"
     except Exception as e:
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.async_data_generator(): Exception occured - {}\n{}".format(
-                str(e), traceback.format_exc()
+        verbose_proxy_logger.exception(
+            "litellm.proxy.proxy_server.async_data_generator(): Exception occured - {}".format(
+                str(e)
             )
         )
         await proxy_logging_obj.post_call_failure_hook(
@@ -2512,9 +2578,9 @@ async def async_data_generator_anthropic(
             except Exception as e:
                 yield f"event: {event_type}\ndata:{str(e)}\n\n"
     except Exception as e:
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.async_data_generator(): Exception occured - {}\n{}".format(
-                str(e), traceback.format_exc()
+        verbose_proxy_logger.exception(
+            "litellm.proxy.proxy_server.async_data_generator(): Exception occured - {}".format(
+                str(e)
             )
         )
         await proxy_logging_obj.post_call_failure_hook(
@@ -3006,68 +3072,13 @@ async def chat_completion(
 
         ### ROUTE THE REQUEST ###
         # Do not change this - it should be a constant time fetch - ALWAYS
-        router_model_names = llm_router.model_names if llm_router is not None else []
-        # skip router if user passed their key
-        if "api_key" in data:
-            tasks.append(litellm.acompletion(**data))
-        elif "," in data["model"] and llm_router is not None:
-            if (
-                data.get("fastest_response", None) is not None
-                and data["fastest_response"] == True
-            ):
-                tasks.append(llm_router.abatch_completion_fastest_response(**data))
-            else:
-                _models_csv_string = data.pop("model")
-                _models = [model.strip() for model in _models_csv_string.split(",")]
-                tasks.append(llm_router.abatch_completion(models=_models, **data))
-        elif "user_config" in data:
-            # initialize a new router instance. make request using this Router
-            router_config = data.pop("user_config")
-            user_router = litellm.Router(**router_config)
-            tasks.append(user_router.acompletion(**data))
-        elif (
-            llm_router is not None and data["model"] in router_model_names
-        ):  # model in router model list
-            tasks.append(llm_router.acompletion(**data))
-        elif (
-            llm_router is not None and data["model"] in llm_router.get_model_ids()
-        ):  # model in router model list
-            tasks.append(llm_router.acompletion(**data))
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data["model"] in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            tasks.append(llm_router.acompletion(**data))
-        elif (
-            llm_router is not None and data["model"] in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            tasks.append(llm_router.acompletion(**data, specific_deployment=True))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and llm_router.router_general_settings.pass_through_all_models is True
-        ):
-            tasks.append(litellm.acompletion(**data))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            tasks.append(llm_router.acompletion(**data))
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            tasks.append(litellm.acompletion(**data))
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "chat_completion: Invalid model name passed in model="
-                    + data.get("model", "")
-                },
-            )
+        llm_call = await route_request(
+            data=data,
+            route_type="acompletion",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        tasks.append(llm_call)
 
         # wait for call to end
         llm_responses = asyncio.gather(
@@ -3109,6 +3120,7 @@ async def chat_completion(
                 response_cost=response_cost,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                 fastest_response_batch_completion=fastest_response_batch_completion,
+                request_data=data,
                 **additional_headers,
             )
             selected_data_generator = select_data_generator(
@@ -3143,6 +3155,7 @@ async def chat_completion(
                 response_cost=response_cost,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                 fastest_response_batch_completion=fastest_response_batch_completion,
+                request_data=data,
                 **additional_headers,
             )
         )
@@ -3183,10 +3196,8 @@ async def chat_completion(
         _chat_response.usage = _usage  # type: ignore
         return _chat_response
     except Exception as e:
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.chat_completion(): Exception occured - {}\n{}".format(
-                get_error_message_str(e=e), traceback.format_exc()
-            )
+        verbose_proxy_logger.exception(
+            f"litellm.proxy.proxy_server.chat_completion(): Exception occured - {str(e)}"
         )
         await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict, original_exception=e, request_data=data
@@ -3290,58 +3301,15 @@ async def completion(
         )
 
         ### ROUTE THE REQUESTs ###
-        router_model_names = llm_router.model_names if llm_router is not None else []
-        # skip router if user passed their key
-        if "api_key" in data:
-            llm_response = asyncio.create_task(litellm.atext_completion(**data))
-        elif (
-            llm_router is not None and data["model"] in router_model_names
-        ):  # model in router model list
-            llm_response = asyncio.create_task(llm_router.atext_completion(**data))
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data["model"] in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            llm_response = asyncio.create_task(llm_router.atext_completion(**data))
-        elif (
-            llm_router is not None and data["model"] in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            llm_response = asyncio.create_task(
-                llm_router.atext_completion(**data, specific_deployment=True)
-            )
-        elif (
-            llm_router is not None and data["model"] in llm_router.get_model_ids()
-        ):  # model in router model list
-            llm_response = asyncio.create_task(llm_router.atext_completion(**data))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and llm_router.router_general_settings.pass_through_all_models is True
-        ):
-            llm_response = asyncio.create_task(litellm.atext_completion(**data))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            llm_response = asyncio.create_task(llm_router.atext_completion(**data))
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            llm_response = asyncio.create_task(litellm.atext_completion(**data))
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "completion: Invalid model name passed in model="
-                    + data.get("model", "")
-                },
-            )
+        llm_call = await route_request(
+            data=data,
+            route_type="atext_completion",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
 
         # Await the llm_response task
-        response = await llm_response
+        response = await llm_call
 
         hidden_params = getattr(response, "_hidden_params", {}) or {}
         model_id = hidden_params.get("model_id", None) or ""
@@ -3369,6 +3337,7 @@ async def completion(
                 api_base=api_base,
                 version=version,
                 response_cost=response_cost,
+                request_data=data,
             )
             selected_data_generator = select_data_generator(
                 response=response,
@@ -3390,6 +3359,7 @@ async def completion(
                 api_base=api_base,
                 version=version,
                 response_cost=response_cost,
+                request_data=data,
             )
         )
         await check_response_size_is_safe(response=response)
@@ -3555,59 +3525,13 @@ async def embeddings(
         )
 
         ## ROUTE TO CORRECT ENDPOINT ##
-        # skip router if user passed their key
-        if "api_key" in data:
-            tasks.append(litellm.aembedding(**data))
-        elif "user_config" in data:
-            # initialize a new router instance. make request using this Router
-            router_config = data.pop("user_config")
-            user_router = litellm.Router(**router_config)
-            tasks.append(user_router.aembedding(**data))
-        elif (
-            llm_router is not None and data["model"] in router_model_names
-        ):  # model in router model list
-            tasks.append(llm_router.aembedding(**data))
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data["model"] in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            tasks.append(
-                llm_router.aembedding(**data)
-            )  # ensure this goes the llm_router, router will do the correct alias mapping
-        elif (
-            llm_router is not None and data["model"] in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            tasks.append(llm_router.aembedding(**data, specific_deployment=True))
-        elif (
-            llm_router is not None and data["model"] in llm_router.get_model_ids()
-        ):  # model in router deployments, calling a specific deployment on the router
-            tasks.append(llm_router.aembedding(**data))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and llm_router.router_general_settings.pass_through_all_models is True
-        ):
-            tasks.append(litellm.aembedding(**data))
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            tasks.append(llm_router.aembedding(**data))
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            tasks.append(litellm.aembedding(**data))
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "embeddings: Invalid model name passed in model="
-                    + data.get("model", "")
-                },
-            )
+        llm_call = await route_request(
+            data=data,
+            route_type="aembedding",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        tasks.append(llm_call)
 
         # wait for call to end
         llm_responses = asyncio.gather(
@@ -3643,6 +3567,7 @@ async def embeddings(
                 response_cost=response_cost,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                 call_id=litellm_call_id,
+                request_data=data,
             )
         )
         await check_response_size_is_safe(response=response)
@@ -3658,12 +3583,11 @@ async def embeddings(
             e,
             litellm_debug_info,
         )
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.embeddings(): Exception occured - {}\n{}".format(
-                str(e), traceback.format_exc()
+        verbose_proxy_logger.exception(
+            "litellm.proxy.proxy_server.embeddings(): Exception occured - {}".format(
+                str(e)
             )
         )
-        verbose_proxy_logger.debug(traceback.format_exc())
         if isinstance(e, HTTPException):
             message = get_error_message_str(e)
             raise ProxyException(
@@ -3738,46 +3662,13 @@ async def image_generation(
         )
 
         ## ROUTE TO CORRECT ENDPOINT ##
-        # skip router if user passed their key
-        if "api_key" in data:
-            response = await litellm.aimage_generation(**data)
-        elif (
-            llm_router is not None and data["model"] in router_model_names
-        ):  # model in router model list
-            response = await llm_router.aimage_generation(**data)
-        elif (
-            llm_router is not None and data["model"] in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.aimage_generation(
-                **data, specific_deployment=True
-            )
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data["model"] in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            response = await llm_router.aimage_generation(
-                **data
-            )  # ensure this goes the llm_router, router will do the correct alias mapping
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.aimage_generation(**data)
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            response = await litellm.aimage_generation(**data)
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "image_generation: Invalid model name passed in model="
-                    + data.get("model", "")
-                },
-            )
+        llm_call = await route_request(
+            data=data,
+            route_type="aimage_generation",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        response = await llm_call
 
         ### ALERTING ###
         asyncio.create_task(
@@ -3803,6 +3694,7 @@ async def image_generation(
                 response_cost=response_cost,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                 call_id=litellm_call_id,
+                request_data=data,
             )
         )
 
@@ -3885,44 +3777,13 @@ async def audio_speech(
         )
 
         ## ROUTE TO CORRECT ENDPOINT ##
-        # skip router if user passed their key
-        if "api_key" in data:
-            response = await litellm.aspeech(**data)
-        elif (
-            llm_router is not None and data["model"] in router_model_names
-        ):  # model in router model list
-            response = await llm_router.aspeech(**data)
-        elif (
-            llm_router is not None and data["model"] in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.aspeech(**data, specific_deployment=True)
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data["model"] in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            response = await llm_router.aspeech(
-                **data
-            )  # ensure this goes the llm_router, router will do the correct alias mapping
-        elif (
-            llm_router is not None
-            and data["model"] not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.aspeech(**data)
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            response = await litellm.aspeech(**data)
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "audio_speech: Invalid model name passed in model="
-                    + data.get("model", "")
-                },
-            )
+        llm_call = await route_request(
+            data=data,
+            route_type="aspeech",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        response = await llm_call
 
         ### ALERTING ###
         asyncio.create_task(
@@ -3955,6 +3816,7 @@ async def audio_speech(
             model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
             fastest_response_batch_completion=None,
             call_id=litellm_call_id,
+            request_data=data,
         )
 
         selected_data_generator = select_data_generator(
@@ -4055,47 +3917,13 @@ async def audio_transcriptions(
             )
 
             ## ROUTE TO CORRECT ENDPOINT ##
-            # skip router if user passed their key
-            if "api_key" in data:
-                response = await litellm.atranscription(**data)
-            elif (
-                llm_router is not None and data["model"] in router_model_names
-            ):  # model in router model list
-                response = await llm_router.atranscription(**data)
-
-            elif (
-                llm_router is not None and data["model"] in llm_router.deployment_names
-            ):  # model in router deployments, calling a specific deployment on the router
-                response = await llm_router.atranscription(
-                    **data, specific_deployment=True
-                )
-            elif (
-                llm_router is not None
-                and llm_router.model_group_alias is not None
-                and data["model"] in llm_router.model_group_alias
-            ):  # model set in model_group_alias
-                response = await llm_router.atranscription(
-                    **data
-                )  # ensure this goes the llm_router, router will do the correct alias mapping
-            elif (
-                llm_router is not None
-                and data["model"] not in router_model_names
-                and (
-                    llm_router.default_deployment is not None
-                    or len(llm_router.provider_default_deployments) > 0
-                )
-            ):  # model in router deployments, calling a specific deployment on the router
-                response = await llm_router.atranscription(**data)
-            elif user_model is not None:  # `litellm --model <your-model-name>`
-                response = await litellm.atranscription(**data)
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "error": "audio_transcriptions: Invalid model name passed in model="
-                        + data.get("model", "")
-                    },
-                )
+            llm_call = await route_request(
+                data=data,
+                route_type="atranscription",
+                llm_router=llm_router,
+                user_model=user_model,
+            )
+            response = await llm_call
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         finally:
@@ -4126,6 +3954,7 @@ async def audio_transcriptions(
                 response_cost=response_cost,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                 call_id=litellm_call_id,
+                request_data=data,
             )
         )
 
@@ -4229,6 +4058,7 @@ async def get_assistants(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4324,6 +4154,7 @@ async def create_assistant(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4419,6 +4250,7 @@ async def delete_assistant(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4514,6 +4346,7 @@ async def create_threads(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4608,6 +4441,7 @@ async def get_thread(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4705,6 +4539,7 @@ async def add_messages(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4798,6 +4633,7 @@ async def get_messages(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -4905,6 +4741,7 @@ async def run_thread(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -5027,6 +4864,7 @@ async def create_batch(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -5122,6 +4960,7 @@ async def retrieve_batch(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -5311,40 +5150,13 @@ async def moderations(
         start_time = time.time()
 
         ## ROUTE TO CORRECT ENDPOINT ##
-        # skip router if user passed their key
-        if "api_key" in data:
-            response = await litellm.amoderation(**data)
-        elif (
-            llm_router is not None and data.get("model") in router_model_names
-        ):  # model in router model list
-            response = await llm_router.amoderation(**data)
-        elif (
-            llm_router is not None and data.get("model") in llm_router.deployment_names
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.amoderation(**data, specific_deployment=True)
-        elif (
-            llm_router is not None
-            and llm_router.model_group_alias is not None
-            and data.get("model") in llm_router.model_group_alias
-        ):  # model set in model_group_alias
-            response = await llm_router.amoderation(
-                **data
-            )  # ensure this goes the llm_router, router will do the correct alias mapping
-        elif (
-            llm_router is not None
-            and data.get("model") not in router_model_names
-            and (
-                llm_router.default_deployment is not None
-                or len(llm_router.provider_default_deployments) > 0
-            )
-        ):  # model in router deployments, calling a specific deployment on the router
-            response = await llm_router.amoderation(**data)
-        elif user_model is not None:  # `litellm --model <your-model-name>`
-            response = await litellm.amoderation(**data)
-        else:
-            # /moderations does not need a "model" passed
-            # see https://platform.openai.com/docs/api-reference/moderations
-            response = await litellm.amoderation(**data)
+        llm_call = await route_request(
+            data=data,
+            route_type="amoderation",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        response = await llm_call
 
         ### ALERTING ###
         asyncio.create_task(
@@ -5367,6 +5179,7 @@ async def moderations(
                 api_base=api_base,
                 version=version,
                 model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
+                request_data=data,
             )
         )
 
@@ -5536,6 +5349,7 @@ async def anthropic_response(
                 api_base=api_base,
                 version=version,
                 response_cost=response_cost,
+                request_data=data,
             )
         )
 
@@ -5597,9 +5411,9 @@ async def anthropic_response(
         await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict, original_exception=e, request_data=data
         )
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.anthropic_response(): Exception occured - {}\n{}".format(
-                str(e), traceback.format_exc()
+        verbose_proxy_logger.exception(
+            "litellm.proxy.proxy_server.anthropic_response(): Exception occured - {}".format(
+                str(e)
             )
         )
         error_msg = f"{str(e)}"
@@ -9430,6 +9244,7 @@ async def get_config_list(
         "global_max_parallel_requests": {"type": "Integer"},
         "max_request_size_mb": {"type": "Integer"},
         "max_response_size_mb": {"type": "Integer"},
+        "pass_through_endpoints": {"type": "PydanticModel"},
     }
 
     return_val = []
@@ -9437,21 +9252,79 @@ async def get_config_list(
     for field_name, field_info in ConfigGeneralSettings.model_fields.items():
         if field_name in allowed_args:
 
-            _stored_in_db = None
-            if field_name in db_general_settings_dict:
-                _stored_in_db = True
-            elif field_name in general_settings:
-                _stored_in_db = False
+            ## HANDLE TYPED DICT
 
-            _response_obj = ConfigList(
-                field_name=field_name,
-                field_type=allowed_args[field_name]["type"],
-                field_description=field_info.description or "",
-                field_value=general_settings.get(field_name, None),
-                stored_in_db=_stored_in_db,
-                field_default_value=field_info.default,
-            )
-            return_val.append(_response_obj)
+            typed_dict_type = allowed_args[field_name]["type"]
+
+            if typed_dict_type == "PydanticModel":
+                if field_name == "pass_through_endpoints":
+                    pydantic_class_list = [PassThroughGenericEndpoint]
+                else:
+                    pydantic_class_list = []
+
+                for pydantic_class in pydantic_class_list:
+                    # Get type hints from the TypedDict to create FieldDetail objects
+                    nested_fields = [
+                        FieldDetail(
+                            field_name=sub_field,
+                            field_type=sub_field_type.__name__,
+                            field_description="",  # Add custom logic if descriptions are available
+                            field_default_value=general_settings.get(sub_field, None),
+                            stored_in_db=None,
+                        )
+                        for sub_field, sub_field_type in pydantic_class.__annotations__.items()
+                    ]
+
+                    idx = 0
+                    for (
+                        sub_field,
+                        sub_field_info,
+                    ) in pydantic_class.model_fields.items():
+                        if (
+                            hasattr(sub_field_info, "description")
+                            and sub_field_info.description is not None
+                        ):
+                            nested_fields[idx].field_description = (
+                                sub_field_info.description
+                            )
+                        idx += 1
+
+                    _stored_in_db = None
+                    if field_name in db_general_settings_dict:
+                        _stored_in_db = True
+                    elif field_name in general_settings:
+                        _stored_in_db = False
+
+                    _response_obj = ConfigList(
+                        field_name=field_name,
+                        field_type=allowed_args[field_name]["type"],
+                        field_description=field_info.description or "",
+                        field_value=general_settings.get(field_name, None),
+                        stored_in_db=_stored_in_db,
+                        field_default_value=field_info.default,
+                        nested_fields=nested_fields,
+                    )
+                    return_val.append(_response_obj)
+
+            else:
+                nested_fields = None
+
+                _stored_in_db = None
+                if field_name in db_general_settings_dict:
+                    _stored_in_db = True
+                elif field_name in general_settings:
+                    _stored_in_db = False
+
+                _response_obj = ConfigList(
+                    field_name=field_name,
+                    field_type=allowed_args[field_name]["type"],
+                    field_description=field_info.description or "",
+                    field_value=general_settings.get(field_name, None),
+                    stored_in_db=_stored_in_db,
+                    field_default_value=field_info.default,
+                    nested_fields=nested_fields,
+                )
+                return_val.append(_response_obj)
 
     return return_val
 
@@ -9697,12 +9570,11 @@ async def get_config():
             "available_callbacks": all_available_callbacks,
         }
     except Exception as e:
-        verbose_proxy_logger.error(
-            "litellm.proxy.proxy_server.get_config(): Exception occured - {}\n{}".format(
-                str(e), traceback.format_exc()
+        verbose_proxy_logger.exception(
+            "litellm.proxy.proxy_server.get_config(): Exception occured - {}".format(
+                str(e)
             )
         )
-        verbose_proxy_logger.debug(traceback.format_exc())
         if isinstance(e, HTTPException):
             raise ProxyException(
                 message=getattr(e, "detail", f"Authentication Error({str(e)})"),
@@ -9865,6 +9737,8 @@ def cleanup_router_config_variables():
 app.include_router(router)
 app.include_router(fine_tuning_router)
 app.include_router(vertex_router)
+app.include_router(gemini_router)
+app.include_router(pass_through_router)
 app.include_router(health_router)
 app.include_router(key_management_router)
 app.include_router(internal_user_router)

@@ -35,6 +35,7 @@ from litellm.types.llms.anthropic import (
     AnthropicResponseContentBlockText,
     AnthropicResponseContentBlockToolUse,
     AnthropicResponseUsageBlock,
+    AnthropicSystemMessageContent,
     ContentBlockDelta,
     ContentBlockStart,
     ContentBlockStop,
@@ -759,6 +760,7 @@ class AnthropicChatCompletion(BaseLLM):
         ## CALCULATING USAGE
         prompt_tokens = completion_response["usage"]["input_tokens"]
         completion_tokens = completion_response["usage"]["output_tokens"]
+        _usage = completion_response["usage"]
         total_tokens = prompt_tokens + completion_tokens
 
         model_response.created = int(time.time())
@@ -768,6 +770,11 @@ class AnthropicChatCompletion(BaseLLM):
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
         )
+
+        if "cache_creation_input_tokens" in _usage:
+            usage["cache_creation_input_tokens"] = _usage["cache_creation_input_tokens"]
+        if "cache_read_input_tokens" in _usage:
+            usage["cache_read_input_tokens"] = _usage["cache_read_input_tokens"]
         setattr(model_response, "usage", usage)  # type: ignore
         return model_response
 
@@ -901,6 +908,7 @@ class AnthropicChatCompletion(BaseLLM):
             # Separate system prompt from rest of message
             system_prompt_indices = []
             system_prompt = ""
+            anthropic_system_message_list = None
             for idx, message in enumerate(messages):
                 if message["role"] == "system":
                     valid_content: bool = False
@@ -908,8 +916,23 @@ class AnthropicChatCompletion(BaseLLM):
                         system_prompt += message["content"]
                         valid_content = True
                     elif isinstance(message["content"], list):
-                        for content in message["content"]:
-                            system_prompt += content.get("text", "")
+                        for _content in message["content"]:
+                            anthropic_system_message_content = (
+                                AnthropicSystemMessageContent(
+                                    type=_content.get("type"),
+                                    text=_content.get("text"),
+                                )
+                            )
+                            if "cache_control" in _content:
+                                anthropic_system_message_content["cache_control"] = (
+                                    _content["cache_control"]
+                                )
+
+                            if anthropic_system_message_list is None:
+                                anthropic_system_message_list = []
+                            anthropic_system_message_list.append(
+                                anthropic_system_message_content
+                            )
                         valid_content = True
 
                     if valid_content:
@@ -919,17 +942,24 @@ class AnthropicChatCompletion(BaseLLM):
                     messages.pop(idx)
             if len(system_prompt) > 0:
                 optional_params["system"] = system_prompt
+
+            # Handling anthropic API Prompt Caching
+            if anthropic_system_message_list is not None:
+                optional_params["system"] = anthropic_system_message_list
             # Format rest of message according to anthropic guidelines
             try:
                 messages = prompt_factory(
                     model=model, messages=messages, custom_llm_provider="anthropic"
                 )
             except Exception as e:
+                verbose_logger.exception(
+                    "litellm.llms.anthropic.py::completion() - Exception occurred - {}\nReceived Messages: {}".format(
+                        str(e), messages
+                    )
+                )
                 raise AnthropicError(
                     status_code=400,
-                    message="{}\n{}\nReceived Messages={}".format(
-                        str(e), traceback.format_exc(), messages
-                    ),
+                    message="{}\nReceived Messages={}".format(str(e), messages),
                 )
 
         ## Load Config
@@ -954,6 +984,8 @@ class AnthropicChatCompletion(BaseLLM):
                 else:  # assume openai tool call
                     new_tool = tool["function"]
                     new_tool["input_schema"] = new_tool.pop("parameters")  # rename key
+                    if "cache_control" in tool:
+                        new_tool["cache_control"] = tool["cache_control"]
                     anthropic_tools.append(new_tool)
 
             optional_params["tools"] = anthropic_tools
@@ -1090,6 +1122,7 @@ class ModelResponseIterator:
         self.streaming_response = streaming_response
         self.response_iterator = self.streaming_response
         self.content_blocks: List[ContentBlockDelta] = []
+        self.tool_index = -1
 
     def check_empty_tool_call_args(self) -> bool:
         """
@@ -1139,7 +1172,7 @@ class ModelResponseIterator:
                             "name": None,
                             "arguments": content_block["delta"]["partial_json"],
                         },
-                        "index": content_block["index"],
+                        "index": self.tool_index,
                     }
             elif type_chunk == "content_block_start":
                 """
@@ -1151,6 +1184,7 @@ class ModelResponseIterator:
                 if content_block_start["content_block"]["type"] == "text":
                     text = content_block_start["content_block"]["text"]
                 elif content_block_start["content_block"]["type"] == "tool_use":
+                    self.tool_index += 1
                     tool_use = {
                         "id": content_block_start["content_block"]["id"],
                         "type": "function",
@@ -1158,7 +1192,7 @@ class ModelResponseIterator:
                             "name": content_block_start["content_block"]["name"],
                             "arguments": "",
                         },
-                        "index": content_block_start["index"],
+                        "index": self.tool_index,
                     }
             elif type_chunk == "content_block_stop":
                 content_block_stop = ContentBlockStop(**chunk)  # type: ignore
@@ -1172,7 +1206,7 @@ class ModelResponseIterator:
                             "name": None,
                             "arguments": "{}",
                         },
-                        "index": content_block_stop["index"],
+                        "index": self.tool_index,
                     }
             elif type_chunk == "message_delta":
                 """

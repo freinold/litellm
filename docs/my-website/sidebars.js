@@ -23,7 +23,7 @@ const sidebars = {
       label: "💥 LiteLLM Proxy Server",
       link: {
         type: "generated-index",
-        title: "💥 LiteLLM Proxy Server",
+        title: "💥 LiteLLM Proxy Server (LLM Gateway)",
         description: `OpenAI Proxy Server (LLM Gateway) to call 100+ LLMs in a unified interface & track spend, set budgets per virtual key/user`,
         slug: "/simple_proxy",
       },
@@ -66,6 +66,7 @@ const sidebars = {
         "proxy/customers",
         "proxy/billing",
         "proxy/token_auth",
+        "proxy/oauth2",
         "proxy/alerting",
         "proxy/ui",
         "proxy/prometheus",
@@ -151,7 +152,7 @@ const sidebars = {
     },
     {
       type: "category",
-      label: "Chat Completions (litellm.completion)",
+      label: "Chat Completions (litellm.completion + PROXY)",
       link: {
         type: "generated-index",
         title: "Chat Completions",
@@ -191,7 +192,8 @@ const sidebars = {
         "batches",
         "fine_tuning",
         "anthropic_completion",
-        "vertex_ai"
+        "pass_through/vertex_ai",
+        "pass_through/google_ai_studio"
       ],
     },
     "scheduler",
@@ -234,7 +236,6 @@ const sidebars = {
         "observability/openmeter",
         "observability/promptlayer_integration",
         "observability/wandb_integration",
-        "observability/slack_integration",
         "observability/traceloop_integration",
         "observability/athina_integration",
         "observability/lunary_integration",
@@ -254,7 +255,6 @@ const sidebars = {
         "tutorials/huggingface_tutorial",
         "tutorials/TogetherAI_liteLLM",
         "tutorials/finetuned_chat_gpt",
-        "tutorials/sagemaker_llms",
         "tutorials/text_completion",
         "tutorials/first_playground",
         "tutorials/model_fallbacks",
